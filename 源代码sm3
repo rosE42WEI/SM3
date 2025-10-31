@@ -1,0 +1,303 @@
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <cstring>
+#include <ctime>
+#include <cstdint>
+#include <vector>
+#include <stdexcept>
+#include <iomanip>  // 用于setprecision
+
+// SM3算法工具类封装
+class SM3Hash {
+private:
+    // 初始IV值（GM/T 0004-2012标准）
+    static const uint32_t SM3_IV[8];
+    // 常量Tj
+    static const uint32_t T1;
+    static const uint32_t T2;
+
+    // 循环左移操作
+    static uint32_t RotL(uint32_t x, int n) {
+        return (x << n) | (x >> (32 - n));
+    }
+
+    // P0置换
+    static uint32_t P0(uint32_t x) {
+        return x ^ RotL(x, 9) ^ RotL(x, 17);
+    }
+
+    // P1置换
+    static uint32_t P1(uint32_t x) {
+        return x ^ RotL(x, 15) ^ RotL(x, 23);
+    }
+
+    // FF函数（1-16轮）
+    static uint32_t FF1(uint32_t x, uint32_t y, uint32_t z) {
+        return x ^ y ^ z;
+    }
+
+    // FF函数（17-64轮）
+    static uint32_t FF2(uint32_t x, uint32_t y, uint32_t z) {
+        return (x & y) | (x & z) | (y & z);
+    }
+
+    // GG函数（1-16轮）
+    static uint32_t GG1(uint32_t x, uint32_t y, uint32_t z) {
+        return x ^ y ^ z;
+    }
+
+    // GG函数（17-64轮）
+    static uint32_t GG2(uint32_t x, uint32_t y, uint32_t z) {
+        return (x & y) | ((~x) & z);
+    }
+
+    // 消息填充：返回填充后的字节向量
+    static std::vector<uint8_t> PadMessage(const uint8_t* input, size_t inputLen) {
+        std::vector<uint8_t> paddedMsg;
+        uint64_t inputBitLen = static_cast<uint64_t>(inputLen) * 8;
+
+        // 复制原始数据
+        paddedMsg.insert(paddedMsg.end(), input, input + inputLen);
+        // 补1bit
+        paddedMsg.push_back(0x80);
+        // 补0bit，直到长度 ≡ 56 mod 64
+        while (paddedMsg.size() % 64 != 56) {
+            paddedMsg.push_back(0x00);
+        }
+        // 补原始长度（大端序）
+        for (int i = 0; i < 8; ++i) {
+            paddedMsg.push_back(static_cast<uint8_t>((inputBitLen >> (56 - 8 * i)) & 0xFF));
+        }
+
+        return paddedMsg;
+    }
+
+    // 分组扩展：生成W和W'数组
+    static void ExpandBlock(const std::vector<uint8_t>& block, uint32_t W[68], uint32_t W1[64]) {
+        // 初始化W[0]-W[15]（大端序）
+        for (int i = 0; i < 16; ++i) {
+            W[i] = (static_cast<uint32_t>(block[4 * i]) << 24) |
+                   (static_cast<uint32_t>(block[4 * i + 1]) << 16) |
+                   (static_cast<uint32_t>(block[4 * i + 2]) << 8) |
+                   static_cast<uint32_t>(block[4 * i + 3]);
+        }
+
+        // 计算W[16]-W[67]
+        for (int j = 16; j < 68; ++j) {
+            W[j] = P1(W[j - 16] ^ W[j - 9] ^ RotL(W[j - 3], 15)) ^
+                   RotL(W[j - 13], 7) ^ W[j - 6];
+        }
+
+        // 计算W'[0]-W'[63]
+        for (int j = 0; j < 64; ++j) {
+            W1[j] = W[j] ^ W[j + 4];
+        }
+    }
+
+    // 压缩函数：更新链接变量
+    static void CompressBlock(uint32_t cv[8], const std::vector<uint8_t>& block) {
+        uint32_t W[68] = { 0 };
+        uint32_t W1[64] = { 0 };
+        ExpandBlock(block, W, W1);
+
+        // 初始化压缩变量
+        uint32_t A = cv[0], B = cv[1], C = cv[2], D = cv[3];
+        uint32_t E = cv[4], F = cv[5], G = cv[6], H = cv[7];
+        uint32_t SS1, SS2, TT1, TT2;
+
+        // 64轮迭代
+        for (int j = 0; j < 64; ++j) {
+            if (j < 16) {
+                // 1-16轮计算
+                SS1 = RotL((RotL(A, 12) + E + RotL(T1, j)), 7);
+                SS2 = SS1 ^ RotL(A, 12);
+                TT1 = FF1(A, B, C) + D + SS2 + W1[j];
+                TT2 = GG1(E, F, G) + H + SS1 + W[j];
+            } else {
+                // 17-64轮计算
+                SS1 = RotL((RotL(A, 12) + E + RotL(T2, j)), 7);
+                SS2 = SS1 ^ RotL(A, 12);
+                TT1 = FF2(A, B, C) + D + SS2 + W1[j];
+                TT2 = GG2(E, F, G) + H + SS1 + W[j];
+            }
+
+            // 更新压缩变量
+            D = C;
+            C = RotL(B, 9);
+            B = A;
+            A = TT1;
+            H = G;
+            G = RotL(F, 19);
+            F = E;
+            E = P0(TT2);
+        }
+
+        // 异或更新链接变量
+        cv[0] ^= A;
+        cv[1] ^= B;
+        cv[2] ^= C;
+        cv[3] ^= D;
+        cv[4] ^= E;
+        cv[5] ^= F;
+        cv[6] ^= G;
+        cv[7] ^= H;
+    }
+
+public:
+    // 计算字节数组的SM3哈希，返回64位十六进制字符串
+    static std::string CalculateHash(const uint8_t* input, size_t inputLen) {
+        if (input == nullptr && inputLen > 0) {
+            throw std::invalid_argument("输入数据为空指针但长度大于0");
+        }
+
+        // 1. 消息填充
+        std::vector<uint8_t> paddedMsg = PadMessage(input, inputLen);
+        // 2. 初始化链接变量
+        uint32_t cv[8];
+        std::memcpy(cv, SM3_IV, sizeof(SM3_IV));
+
+        // 3. 分组处理（每组64字节）
+        for (size_t i = 0; i < paddedMsg.size(); i += 64) {
+            std::vector<uint8_t> block(paddedMsg.begin() + i, paddedMsg.begin() + i + 64);
+            CompressBlock(cv, block);
+        }
+
+        // 4. 转换为十六进制字符串
+        const char* hexTable = "0123456789abcdef";
+        std::string hashHex;
+        hashHex.reserve(64);
+        for (int i = 0; i < 8; ++i) {
+            hashHex += hexTable[(cv[i] >> 24) & 0x0F];
+            hashHex += hexTable[(cv[i] >> 20) & 0x0F];
+            hashHex += hexTable[(cv[i] >> 16) & 0x0F];
+            hashHex += hexTable[(cv[i] >> 12) & 0x0F];
+            hashHex += hexTable[(cv[i] >> 8) & 0x0F];
+            hashHex += hexTable[(cv[i] >> 4) & 0x0F];
+            hashHex += hexTable[cv[i] & 0x0F];
+        }
+
+        return hashHex;
+    }
+
+    // 计算字符串的SM3哈希（默认UTF-8编码）
+    static std::string CalculateHash(const std::string& input) {
+        return CalculateHash(reinterpret_cast<const uint8_t*>(input.c_str()), input.size());
+    }
+
+    // 计算文件的SM3哈希
+    static std::string CalculateFileHash(const std::string& filePath) {
+        std::ifstream file(filePath, std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("无法打开文件：" + filePath);
+        }
+
+        // 初始化链接变量
+        uint32_t cv[8];
+        std::memcpy(cv, SM3_IV, sizeof(SM3_IV));
+
+        // 缓冲区（每次读取64字节，对应一个分组）
+        const size_t BUF_SIZE = 64;
+        std::vector<uint8_t> buf(BUF_SIZE, 0);
+        size_t readLen = 0;
+        uint64_t totalBitLen = 0;
+
+        // 读取完整分组
+        while (file.read(reinterpret_cast<char*>(buf.data()), BUF_SIZE)) {
+            totalBitLen += BUF_SIZE * 8;
+            CompressBlock(cv, buf);
+            buf.assign(BUF_SIZE, 0);
+        }
+
+        // 处理剩余数据
+        readLen = file.gcount();
+        totalBitLen += readLen * 8;
+        if (readLen > 0) {
+            buf.resize(readLen);
+            std::vector<uint8_t> paddedBlock = PadMessage(buf.data(), readLen);
+            for (size_t i = 0; i < paddedBlock.size(); i += 64) {
+                std::vector<uint8_t> block(paddedBlock.begin() + i, paddedBlock.begin() + i + 64);
+                CompressBlock(cv, block);
+            }
+        }
+
+        file.close();
+
+        // 转换为十六进制字符串
+        const char* hexTable = "0123456789abcdef";
+        std::string hashHex;
+        hashHex.reserve(64);
+        for (int i = 0; i < 8; ++i) {
+            hashHex += hexTable[(cv[i] >> 24) & 0x0F];
+            hashHex += hexTable[(cv[i] >> 20) & 0x0F];
+            hashHex += hexTable[(cv[i] >> 16) & 0x0F];
+            hashHex += hexTable[(cv[i] >> 12) & 0x0F];
+            hashHex += hexTable[(cv[i] >> 8) & 0x0F];
+            hashHex += hexTable[(cv[i] >> 4) & 0x0F];
+            hashHex += hexTable[cv[i] & 0x0F];
+        }
+
+        return hashHex;
+    }
+};
+
+// 静态成员变量初始化
+const uint32_t SM3Hash::SM3_IV[8] = {
+    0x7380166f, 0x4914b2b9, 0x172442d7, 0xda8a0600,
+    0xa96f30bc, 0x163138aa, 0xe38dee4d, 0xb0fb0e4e
+};
+const uint32_t SM3Hash::T1 = 0x79cc4519;
+const uint32_t SM3Hash::T2 = 0x7a879d8a;
+
+// 命令行工具实现
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        std::cout << "SM3算法C++命令行工具（跨平台兼容）" << std::endl;
+        std::cout << "使用方法：" << std::endl;
+        std::cout << "  计算字符串哈希：" << argv[0] << " -s \"待计算字符串\"" << std::endl;
+        std::cout << "  计算文件哈希：" << argv[0] << " -f 待计算文件路径" << std::endl;
+        std::cout << "示例：" << std::endl;
+        std::cout << "  " << argv[0] << " -s \"abc\"" << std::endl;
+        std::cout << "  " << argv[0] << " -f test.txt" << std::endl;
+        return 1;
+    }
+
+    std::string option = argv[1];
+    std::string target = argv[2];
+    std::string hashResult;
+    clock_t start, end;
+    double costTime;
+
+    try {
+        if (option == "-s") {
+            // 计算字符串哈希
+            start = clock();
+            hashResult = SM3Hash::CalculateHash(target);
+            end = clock();
+            costTime = static_cast<double>(end - start) / CLOCKS_PER_SEC * 1000;
+
+            std::cout << "输入字符串：" << target << std::endl;
+            std::cout << "SM3哈希值：" << hashResult << std::endl;
+            std::cout << "计算耗时：" << std::fixed << std::setprecision(3) << costTime << " 毫秒" << std::endl;
+        } else if (option == "-f") {
+            // 计算文件哈希
+            start = clock();
+            hashResult = SM3Hash::CalculateFileHash(target);
+            end = clock();
+            costTime = static_cast<double>(end - start) / CLOCKS_PER_SEC * 1000;
+
+            std::cout << "输入文件：" << target << std::endl;
+            std::cout << "SM3哈希值：" << hashResult << std::endl;
+            std::cout << "计算耗时：" << std::fixed << std::setprecision(3) << costTime << " 毫秒" << std::endl;
+        } else {
+            std::cerr << "错误：无效参数 " << option << std::endl;
+            std::cerr << "使用 -s 指定字符串输入，或 -f 指定文件输入" << std::endl;
+            return 1;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "执行错误：" << e.what() << std::endl;
+        return 1;
+    }
+
+    return 0;
+}
